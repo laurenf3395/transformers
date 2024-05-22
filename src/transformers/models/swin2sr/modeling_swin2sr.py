@@ -153,12 +153,50 @@ class Swin2SREmbeddings(nn.Module):
 
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.window_size = config.window_size
+    
+    def interpolate_pos_encoding(self, embeddings: torch.Tensor, height: int, width: int) -> torch.Tensor:
+        """
+        This method allows to interpolate the pre-trained position encodings, to be able to use the model on higher
+        resolution images.
+        """
 
-    def forward(self, pixel_values: Optional[torch.FloatTensor]) -> Tuple[torch.Tensor]:
-        embeddings, output_dimensions = self.patch_embeddings(pixel_values)
+        num_patches = embeddings.shape[1] - 1
+        num_positions = self.position_embeddings.shape[1] - 1
+        if num_patches == num_positions and height == width:
+            return self.position_embeddings
+        class_pos_embed = self.position_embeddings[:, 0]
+        patch_pos_embed = self.position_embeddings[:, 1:]
+        dim = embeddings.shape[-1]
+        h0 = height // self.config.patch_size
+        w0 = width // self.config.patch_size
+        # we add a small number to avoid floating point error in the interpolation
+        # see discussion at https://github.com/facebookresearch/dino/issues/8
+        h0, w0 = h0 + 0.1, w0 + 0.1
+        patch_pos_embed = patch_pos_embed.reshape(1, int(math.sqrt(num_positions)), int(math.sqrt(num_positions)), dim)
+        patch_pos_embed = patch_pos_embed.permute(0, 3, 1, 2)
+        patch_pos_embed = nn.functional.interpolate(
+            patch_pos_embed,
+            scale_factor=(h0 / math.sqrt(num_positions), w0 / math.sqrt(num_positions)),
+            mode="bicubic",
+            align_corners=False,
+        )
+        #assert int(h0) == patch_pos_embed.shape[-2] and int(w0) == patch_pos_embed.shape[-1]
+        patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
+        return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1)
+
+
+
+
+    def forward(self, 
+        pixel_values: Optional[torch.FloatTensor],
+        interpolate_pos_encoding:bool = False) -> Tuple[torch.Tensor]:
+        embeddings, output_dimensions = self.patch_embeddings(pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
 
         if self.position_embeddings is not None:
-            embeddings = embeddings + self.position_embeddings
+            if interpolate_pos_encoding:
+                embeddings = embeddings + self.interpolate_pos_encoding(embeddings, height, width)
+            else:
+                embeddings = embeddings + self.position_embeddings
 
         embeddings = self.dropout(embeddings)
 
@@ -180,7 +218,7 @@ class Swin2SRPatchEmbeddings(nn.Module):
         self.projection = nn.Conv2d(num_channels, config.embed_dim, kernel_size=patch_size, stride=patch_size)
         self.layernorm = nn.LayerNorm(config.embed_dim) if normalize_patches else None
 
-    def forward(self, embeddings: Optional[torch.FloatTensor]) -> Tuple[torch.Tensor, Tuple[int]]:
+    def forward(self, embeddings: Optional[torch.FloatTensor], interpolate_pos_encoding: bool = False) -> Tuple[torch.Tensor, Tuple[int]]:
         embeddings = self.projection(embeddings)
         _, _, height, width = embeddings.shape
         output_dimensions = (height, width)
